@@ -42,6 +42,13 @@ test('whole-word mode recognizes punctuation and validates its option', async ()
   await assert.rejects(searchWorkspace(remote, 's', { query: 'cat', wholeWord: 'yes' }), /wholeWord must be boolean/);
 });
 
+test('whole-word mode checks boundaries in case-folded text after Unicode expansions', async () => {
+  const { remote } = fixture({ '.': list(entry('unicode.txt','file')) }, { 'unicode.txt': { 1: page('İ-foo\nİfoo\nfooİ', 3) } });
+  const result = await searchWorkspace(remote, 's', { query: 'foo', wholeWord: true });
+  assert.equal(result.matches.length, 1);
+  assert.equal(result.matches[0].line, 1);
+});
+
 test('case sensitive query and line numbers across pages', async () => {
   const { remote } = fixture({ '.': list(entry('a.ts','file')) }, { 'a.ts': { 1: page('hello',1,false), 2: page('HELLO\nhello',2,true) } });
   const result = await searchWorkspace(remote, 's', { query:'hello', caseSensitive:true });

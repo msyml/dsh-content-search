@@ -9,8 +9,8 @@ const source = await readFile(new URL('../lib/client.source.js', import.meta.url
 
 function fixture(search = async () => ({ matches: [] })) {
   const components = new Map(), slots = [], sessionListeners = new Set(), timers = new Map();
-  const calls = [], bindings = new Map([['a', {}], ['b', {}]]);
-  let current = 'a', dispose, nextTimer = 0, loaderId, dialogHooks = [], hookIndex = 0, ownerCleanup, keyListener, modal = false;
+  const calls = [], bindings = new Map([['a', {}], ['b', {}]]), sidebarTabs = [];
+  let current = 'a', dispose, cleanups = [], nextTimer = 0, loaderId, dialogHooks = [], hookIndex = 0, ownerCleanup, keyListener, modal = false;
   class Element {
     constructor(id, composer = false, editable = true) { this.id = id; this.composer = composer; this.editable = editable; this.isConnected = true; }
     matches(selector) { return selector === '[data-composer-input][contenteditable="true"]' && this.composer && this.editable; }
@@ -23,6 +23,7 @@ function fixture(search = async () => ({ matches: [] })) {
     createElement: (type, props, ...children) => ({ type, props: props || {}, children: children.flat(Infinity).filter(x => x != null) }),
     useSyncExternalStore: (_subscribe, snapshot) => snapshot(),
     useRef: initial => dialogHooks[hookIndex++] ??= { current: initial },
+    useState: initial => [initial, () => {}],
     useEffect: () => {},
     useLayoutEffect: fn => { ownerCleanup = fn(); },
   };
@@ -40,12 +41,14 @@ function fixture(search = async () => ({ matches: [] })) {
   const plugin = vm.runInNewContext(`window.__ModuleLoader__.load({ id: 'dsh-content-search', factory(require) { const module = { exports: {} }; const exports = module.exports;\n${source}\nreturn module.exports; } });`, context);
   const ctx = {
     slots: { inject(name, fn) { slots.push(['inject', name]); fn(); }, register(info, component) { slots.push(['register', info.name, info.id]); components.set(info.id, component); } },
+    betterSidebar: { registerTab(descriptor) { sidebarTabs.push(descriptor); return () => sidebarTabs.splice(sidebarTabs.indexOf(descriptor), 1); } },
     sessions: { binding: id => bindings.get(id) },
     uiSession: { adapter: { current: { getSnapshot: () => ({ key: current }), subscribe(fn) { sessionListeners.add(fn); return () => sessionListeners.delete(fn); } } } },
     remote: { workspaceFiles: {} },
-    effect(fn) { dispose = fn(); },
+    effect(fn) { const cleanup = fn(); if (cleanup) cleanups.push(cleanup); },
   };
   plugin.apply(ctx);
+  dispose = () => { for (const cleanup of cleanups.splice(0).reverse()) cleanup(); };
   const ownerCleanups = [];
   function mount(id, actions) {
     ownerCleanup = undefined;
@@ -61,6 +64,8 @@ function fixture(search = async () => ({ matches: [] })) {
   }
   function find(predicate) { const found = nodes(render(), predicate); assert.equal(found.length, 1); return found[0]; }
   function input(label, value) { find(node => node.props['aria-label'] === label).props.onChange({ target: { value, checked: value } }); }
+  function changeCheckbox(label, checked) { find(node => node.props['aria-label'] === label).props.onChange({ target: { checked } }); }
+  function sidebarFor(sessionId) { return f.sidebarTabs[0].component({ scope: { sessionId } }); }
   function key(key, extra = {}) {
     const event = { key, prevented: false, stopped: false, preventDefault() { this.prevented = true; }, stopPropagation() { this.stopped = true; }, ...extra };
     find(node => node.type === 'section').props.onKeyDown(event); return event;
@@ -75,7 +80,7 @@ function fixture(search = async () => ({ matches: [] })) {
     const event = { target, code: 'KeyF', ctrlKey: true, metaKey: false, altKey: false, shiftKey: false, repeat: false, isComposing: false, defaultPrevented: false, prevented: false, stopped: false, getModifierState: () => false, preventDefault() { this.prevented = true; }, stopPropagation() { this.stopped = true; }, ...overrides };
     keyListener?.(event); return event;
   }
-  return { plugin, loaderId, ctx, calls, bindings, timers, slots, mount, render, find, nodes, input, key, flush, switchTo, dispatch,
+  return { plugin, loaderId, ctx, calls, bindings, timers, slots, sidebarTabs, mount, render, find, nodes, input, changeCheckbox, sidebarFor, key, flush, switchTo, dispatch,
     element: (id, composer = false, editable = true) => new Element(id, composer, editable),
     setModal(value) { modal = value; },
     get hasKeyListener() { return !!keyListener; },
@@ -98,7 +103,11 @@ test('handles Ctrl+F only for the current editable composer and never registers 
     ['inject', 'conversation.input.dock'], ['register', 'conversation.input.dock', 'content-search.owner'],
     ['inject', 'shell.overlay'], ['register', 'shell.overlay', 'content-search.dialog'],
   ]);
-  assert.deepEqual(Array.from(f.plugin.inject), ['slots', 'sessions', 'uiSession', 'remote', 'remote.workspaceFiles']);
+  assert.deepEqual(Array.from(f.plugin.inject), ['slots', 'sessions', 'uiSession', 'remote', 'remote.workspaceFiles', 'betterSidebar']);
+  assert.equal(f.sidebarTabs.length, 1);
+  assert.equal(f.sidebarTabs[0].id, 'dsh-content-search:search');
+  assert.equal(f.sidebarTabs[0].single, true);
+  assert.equal(typeof f.sidebarTabs[0].component, 'function');
   const a = actions(); f.mount('a', a);
   for (const target of [f.element('a'), f.element('b', true), f.element('a', true, false)]) {
     const event = f.dispatch(target); assert.equal(event.prevented, false); assert.equal(f.render(), null);
@@ -109,21 +118,23 @@ test('handles Ctrl+F only for the current editable composer and never registers 
   }
   f.setModal(true); assert.equal(f.dispatch(input).prevented, false); f.setModal(false);
   const event = f.dispatch(input); assert.equal(event.prevented, true); assert.equal(event.stopped, true); assert.match(status(f), /输入内容开始搜索/);
-  f.cleanup(); assert.equal(f.hasKeyListener, false);
+  f.cleanup(); assert.equal(f.hasKeyListener, false); assert.equal(f.sidebarTabs.length, 0);
 });
 
 test('debounces inputs, binds search to the captured session, and inserts the keyboard selection', async () => {
   const f = fixture(async () => ({ ...rows('src/first.js', 'src/with space.js'), truncated: true, warnings: ['部分文件跳过'] }));
   const a = actions(); f.mount('a', a); f.open();
   f.input('搜索内容', 'needle'); f.input('包含文件 glob', '*.js');
-  f.input('全词匹配', true);
+  f.changeCheckbox('全词匹配', true); f.changeCheckbox('区分大小写', true);
   assert.equal(f.timers.size, 1);
   assert.match(status(f), /正在搜索/);
   await f.flush();
   assert.equal(f.calls.length, 1);
   assert.equal(f.calls[0][0], f.ctx.remote); assert.equal(f.calls[0][1], 'a');
-  assert.equal(f.calls[0][2].query, 'needle'); assert.equal(f.calls[0][2].include, '*.js'); assert.equal(f.calls[0][2].wholeWord, true);
+    assert.equal(f.calls[0][2].query, 'needle'); assert.equal(f.calls[0][2].include, '*.js'); assert.equal(f.calls[0][2].caseSensitive, true); assert.equal(f.calls[0][2].wholeWord, true);
   assert.equal(f.calls[0][3].aborted, false);
+  assert.equal(f.nodes(f.render(), node => node.props['aria-label'] === '区分大小写' && node.props.checked === true).length, 1);
+  assert.equal(f.nodes(f.render(), node => node.props['aria-label'] === '全词匹配' && node.props.checked === true).length, 1);
   assert.match(status(f), /2 条匹配（结果不完整）/);
   assert.equal(f.nodes(f.render(), node => node.children?.includes('部分内容未搜索：')).length, 1);
   assert.equal(f.key('Enter', { isComposing: true }).prevented, false);
@@ -134,6 +145,7 @@ test('debounces inputs, binds search to the captured session, and inserts the ke
   assert.equal(a.insertions[0].text, ' @"src/with space.js" ');
   assert.equal(a.insertions[0].captured, a.span);
   assert.equal(f.render(), null);
+  assert.equal(f.nodes(f.render(), node => node.props['aria-label'] === '区分大小写' && node.props.checked === false).length, 0);
   f.cleanup();
 });
 
